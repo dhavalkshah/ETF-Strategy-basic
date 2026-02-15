@@ -3,7 +3,7 @@ from uuid import UUID
 
 from sqlalchemy.orm import Session
 
-from app.core.security import get_password_hash
+from app.core.hashing import get_password_hash
 from app.db.models import User
 from app.schemas.user import UserCreate, UserUpdate
 
