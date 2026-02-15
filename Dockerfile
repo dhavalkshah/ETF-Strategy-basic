@@ -1,24 +1,25 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.11-slim
 
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system deps for psycopg2 + bcrypt
+RUN apt-get update && apt-get install -y \
     build-essential \
-    gcc \
     libpq-dev \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
 
-# Prevent Python from writing .pyc files
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PYTHONUNBUFFERED=1
-
 COPY requirements.txt .
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+
+# Install packages in specific order to avoid conflicts
+RUN pip install --upgrade pip && \
+    # Install all normal dependencies first (includes yfinance with beautifulsoup4>=4.11.1)
+    pip install --no-cache-dir -r requirements.txt && \
+    # Then force install jugaad-data ignoring dependency conflicts
+    pip install --no-cache-dir --no-deps jugaad-data==0.29
 
 COPY . .
 
-EXPOSE 8000
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]

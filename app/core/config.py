@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "supersecretkey" # TODO: Generate a real secret key
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    LOG_LEVEL: str = "DEBUG"
 
     model_config = SettingsConfigDict(env_file=".env")
 

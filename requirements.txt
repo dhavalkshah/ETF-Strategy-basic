@@ -1,5 +1,6 @@
-fastapi~=0.100.0
-uvicorn~=0.23.2
+fastapi~=0.109.0
+pydantic>=2.0.0,<3.0.0
+uvicorn~=0.27.0
 SQLAlchemy~=2.0.0
 alembic~=1.12.0
 psycopg2~=2.9.9
@@ -10,8 +11,16 @@ python-dotenv~=1.0.0
 pytest~=7.4.0
 pytest-cov~=4.1.0
 requests~=2.31.0
-nsepython~=1.0.0
-jugaad-data==0.29
+yfinance>=0.2.40
 pydantic-settings~=2.0.0
 numpy_financial~=1.0.0
 email-validator>=2.0.0
+python-multipart
+pandas>=2.0.0
+numpy>=1.24.0
+scipy>=1.11.0
+beautifulsoup4>=4.11.1
+lxml>=4.9.0
+
+# jugaad-data dependencies (will install jugaad-data separately with --no-deps)
+appdirs>=1.4.4
