@@ -26,13 +26,29 @@ def run_backtest(
     benchmark_data: Optional[List[HistoricalPrice]] = None
 ) -> StrategyResult:
     """
-    Runs backtest for RSI + MA20 strategy with SIP and optional dip buying.
+    OPTIMIZED DAILY SIP STRATEGY with Market-Based Signals
     
-    Optimized for performance with detailed timing logs.
+    Strategy:
+    1. Uses BENCHMARK (NIFTY 50) for market timing, not ETF price
+    2. Daily base SIP with dip buying when market crashes
+    3. Carry-over mechanism: saves money during bull runs, deploys during crashes
+    4. Dip strength weighting: bigger crashes get bigger investments
+    
+    Signals from BENCHMARK:
+    - MA20: 20-day moving average of benchmark
+    - RSI: Relative strength of benchmark
+    - Daily Return: % change in benchmark
+    
+    Investment Decision:
+    - Normal day: Invest base amount, accumulate carry-over
+    - Dip day (benchmark down, below MA20, RSI < 45):
+      → Invest base + portion of carry-over + (dip_strength × multiplier)
     """
     start_time = time.time()
     logger.info(f"=" * 80)
-    logger.info(f"BACKTEST START: {strategy_input.symbol}")
+    logger.info(f"OPTIMIZED BACKTEST START: {strategy_input.symbol}")
+    logger.info(f"Strategy: Market-Based Daily SIP with Smart Dip Buying")
+    logger.info(f"Base SIP: ₹{strategy_input.sip_amount}/day")
     logger.info(f"Date range: {strategy_input.start_date} to {strategy_input.end_date}")
     logger.info(f"=" * 80)
     
@@ -40,93 +56,121 @@ def run_backtest(
         logger.warning("No historical data provided for backtest")
         return _create_empty_result("No historical data available")
     
+    if not benchmark_data:
+        logger.warning("No benchmark data provided - cannot run market-based strategy")
+        return _create_empty_result("Benchmark data required for this strategy")
+    
     try:
-        # Step 1: Convert SQLAlchemy models to DataFrame
+        # Step 1: Convert ETF data to DataFrame
         step_start = time.time()
-        logger.info(f"Step 1: Converting {len(historical_data)} records to DataFrame...")
+        logger.info(f"Step 1: Converting {len(historical_data)} ETF records to DataFrame...")
         
-        # Convert SQLAlchemy models to dict
-        data_dicts = []
+        etf_data_dicts = []
         for hp in historical_data:
-            data_dicts.append({
+            etf_data_dicts.append({
                 'date': hp.date,
-                'open': float(hp.open) if hp.open else 0.0,
-                'high': float(hp.high) if hp.high else 0.0,
-                'low': float(hp.low) if hp.low else 0.0,
-                'close': float(hp.close),
-                'volume': int(hp.volume) if hp.volume else 0
+                'etf_close': float(hp.close),
+                'etf_open': float(hp.open) if hp.open else 0.0,
+                'etf_high': float(hp.high) if hp.high else 0.0,
+                'etf_low': float(hp.low) if hp.low else 0.0,
             })
         
-        df = pd.DataFrame(data_dicts)
-        df['date'] = pd.to_datetime(df['date'])
-        df = df.set_index('date').sort_index()
+        etf_df = pd.DataFrame(etf_data_dicts)
+        etf_df['date'] = pd.to_datetime(etf_df['date'])
+        etf_df = etf_df.set_index('date').sort_index()
         
-        logger.info(f"Step 1 DONE in {time.time() - step_start:.2f}s - DataFrame shape: {df.shape}")
+        logger.info(f"Step 1 DONE in {time.time() - step_start:.2f}s - ETF data: {etf_df.shape}")
         
-        if df.empty or 'close' not in df.columns:
-            logger.error("Invalid historical data structure")
-            return _create_empty_result("Invalid historical data")
-        
-        # Step 2: Filter to date range
+        # Step 2: Convert benchmark data to DataFrame
         step_start = time.time()
-        logger.info(f"Step 2: Filtering to date range...")
+        logger.info(f"Step 2: Converting {len(benchmark_data)} benchmark records...")
         
+        benchmark_data_dicts = []
+        for hp in benchmark_data:
+            benchmark_data_dicts.append({
+                'date': hp.date,
+                'benchmark_close': float(hp.close)
+            })
+        
+        benchmark_df = pd.DataFrame(benchmark_data_dicts)
+        benchmark_df['date'] = pd.to_datetime(benchmark_df['date'])
+        benchmark_df = benchmark_df.set_index('date').sort_index()
+        
+        logger.info(f"Step 2 DONE in {time.time() - step_start:.2f}s - Benchmark data: {benchmark_df.shape}")
+        
+        # Step 3: Merge ETF and Benchmark data
+        step_start = time.time()
+        logger.info(f"Step 3: Merging ETF and benchmark data...")
+        
+        df = pd.merge(
+            etf_df,
+            benchmark_df,
+            left_index=True,
+            right_index=True,
+            how='inner'
+        )
+        
+        # Filter to strategy date range
         df = df.loc[strategy_input.start_date:strategy_input.end_date]
         
-        logger.info(f"Step 2 DONE in {time.time() - step_start:.2f}s - {len(df)} rows after filtering")
+        logger.info(f"Step 3 DONE in {time.time() - step_start:.2f}s - Merged data: {df.shape}")
         
         if df.empty:
-            logger.warning("No data in specified date range")
-            return _create_empty_result("No data in date range")
+            logger.warning("No data after merge")
+            return _create_empty_result("No overlapping data between ETF and benchmark")
         
-        # Step 3: Clean data
+        # Step 4: Clean data
         step_start = time.time()
-        logger.info(f"Step 3: Cleaning data (forward fill and dropna)...")
+        logger.info(f"Step 4: Cleaning and forward filling...")
         
-        df['close'] = df['close'].ffill()
-        df = df.dropna(subset=['close'])
+        df['etf_close'] = df['etf_close'].ffill()
+        df['benchmark_close'] = df['benchmark_close'].ffill()
+        df = df.dropna(subset=['etf_close', 'benchmark_close'])
         
-        logger.info(f"Step 3 DONE in {time.time() - step_start:.2f}s - {len(df)} rows after cleaning")
+        logger.info(f"Step 4 DONE in {time.time() - step_start:.2f}s - {len(df)} clean rows")
         
-        if len(df) < 15:
+        if len(df) < 20:
             logger.warning(f"Insufficient data points: {len(df)}")
             return _create_empty_result("Insufficient data points for backtest")
         
-        # Step 4: Calculate RSI
+        # Step 5: Calculate BENCHMARK indicators (KEY DIFFERENCE!)
         step_start = time.time()
-        logger.info(f"Step 4: Calculating RSI (14 period) on {len(df)} rows...")
+        logger.info(f"Step 5: Calculating BENCHMARK indicators...")
         
-        df['rsi'] = calculate_rsi(df['close'].tolist(), period=14)
+        # Calculate benchmark daily returns
+        df['benchmark_return'] = df['benchmark_close'].pct_change()
         
-        logger.info(f"Step 4 DONE in {time.time() - step_start:.2f}s")
+        # Calculate MA20 on BENCHMARK
+        df['benchmark_ma20'] = calculate_ma(df['benchmark_close'].tolist(), period=20)
         
-        # Step 5: Calculate MA20
-        step_start = time.time()
-        logger.info(f"Step 5: Calculating MA20 on {len(df)} rows...")
-        
-        df['ma20'] = calculate_ma(df['close'].tolist(), period=20)
+        # Calculate RSI on BENCHMARK
+        df['benchmark_rsi'] = calculate_rsi(df['benchmark_close'].tolist(), period=14)
         
         logger.info(f"Step 5 DONE in {time.time() - step_start:.2f}s")
+        logger.info(f"  Using BENCHMARK for all signals (not ETF)")
         
-        # Step 6: Run simulation
+        # Step 6: Run OPTIMIZED simulation
         step_start = time.time()
-        logger.info(f"Step 6: Running backtest simulation...")
+        logger.info(f"Step 6: Running optimized backtest...")
         
-        sip_amount = strategy_input.sip_amount
+        base_sip_amount = strategy_input.sip_amount
         dip_multiplier = strategy_input.dip_multiplier or 1.0
+        carry_util_fraction = strategy_input.carry_over_fraction or 0.5  # Use 50% of carry-over per dip
         
-        cash_balance = 0.0
+        # Initialize
+        carry_over = 0.0
         units_accumulated = 0.0
+        total_investment = 0.0
+        
         transactions: List[TransactionRecord] = []
         equity_curve: List[DailyPortfolioValue] = []
         xirr_transactions: List[Dict[str, Any]] = []
-        total_investment = 0.0
         
-        last_sip_year_month = None
-        transaction_count = 0
-        equity_count = 0
+        # Statistics
+        regular_days = 0
+        dip_days = 0
+        max_carry_over = 0.0
         
-        # Track progress
         total_rows = len(df)
         progress_interval = max(100, total_rows // 10)
         rows_processed = 0
@@ -135,74 +179,92 @@ def run_backtest(
             rows_processed += 1
             
             if rows_processed % progress_interval == 0:
-                logger.info(f"  Progress: {rows_processed}/{total_rows} rows ({rows_processed/total_rows*100:.1f}%)")
+                logger.info(f"  Progress: {rows_processed}/{total_rows} ({rows_processed/total_rows*100:.1f}%)")
             
-            current_close = row['close']
-            current_rsi = row['rsi']
-            current_ma20 = row['ma20']
+            etf_price = row['etf_close']
+            benchmark_return = row['benchmark_return']
+            benchmark_ma20 = row['benchmark_ma20']
+            benchmark_rsi = row['benchmark_rsi']
             
-            if pd.isna(current_close) or current_close <= 0:
+            # Skip if any indicator is missing
+            if pd.isna(etf_price) or pd.isna(benchmark_return) or pd.isna(benchmark_ma20) or pd.isna(benchmark_rsi):
                 continue
             
             current_date_obj = current_date.date()
-            year_month = (current_date.year, current_date.month)
             
-            # Monthly SIP
-            if year_month != last_sip_year_month:
-                cash_balance += sip_amount
-                total_investment += sip_amount
+            # Determine if today is a MARKET DIP DAY
+            is_dip_day = (
+                benchmark_return < 0 and                          # Market down today
+                row['benchmark_close'] < benchmark_ma20 and       # Below 20-day MA
+                benchmark_rsi < 45                                # Market oversold
+            )
+            
+            # Calculate dip strength (how severe is the crash?)
+            dip_strength = abs(benchmark_return) if is_dip_day else 0.0
+            
+            # Determine investment amount
+            if is_dip_day:
+                # DIP DAY: Deploy aggressively
+                # Base + portion of carry_over + dip bonus
+                carry_over_deploy = carry_over * carry_util_fraction
+                dip_bonus = dip_strength * dip_multiplier * 1000  # Scale to reasonable amount
+                
+                investment_today = base_sip_amount + carry_over_deploy + dip_bonus
+                
+                # Reduce carry_over
+                carry_over = carry_over * (1 - carry_util_fraction)
+                
+                transaction_type = TransactionType.DIP_BUY
+                dip_days += 1
+                
+            else:
+                # REGULAR DAY: Invest base amount and accumulate carry-over
+                investment_today = 0
+                carry_over += base_sip_amount  # Save for future dips
+                
+                transaction_type = TransactionType.SIP
+                regular_days += 1
+            
+            # Track max carry-over
+            max_carry_over = max(max_carry_over, carry_over)
+
+            if investment_today > 0:
+                # Execute investment
+                total_investment += investment_today
+                units_bought = investment_today / etf_price
+                units_accumulated += units_bought
+            
+                # Record for XIRR
                 xirr_transactions.append({
                     'date': current_date_obj,
-                    'amount': -sip_amount
+                    'amount': -investment_today
                 })
+
+                # Record transaction
                 transactions.append(TransactionRecord(
                     date=current_date_obj,
-                    type=TransactionType.SIP,
-                    quantity=0.0,
-                    price_per_unit=current_close,
-                    amount=sip_amount,
-                    cash_balance=cash_balance,
+                    type=transaction_type,
+                    quantity=units_bought,
+                    price_per_unit=etf_price,
+                    amount=investment_today,
+                    cash_balance=carry_over,  # Show carry_over as "cash balance"
                     units_accumulated=units_accumulated
                 ))
-                last_sip_year_month = year_month
-                transaction_count += 1
             
-            # Dip buying
-            if (current_rsi is not None and current_ma20 is not None and
-                not pd.isna(current_rsi) and not pd.isna(current_ma20)):
-                
-                if current_rsi < 30 and current_close < current_ma20 and cash_balance > 0:
-                    max_buy_amount = sip_amount * dip_multiplier
-                    buy_amount = min(cash_balance, max_buy_amount)
-                    
-                    if buy_amount > 0:
-                        units_to_buy = buy_amount / current_close
-                        cash_balance -= buy_amount
-                        units_accumulated += units_to_buy
-                        
-                        transactions.append(TransactionRecord(
-                            date=current_date_obj,
-                            type=TransactionType.DIP_BUY,
-                            quantity=units_to_buy,
-                            price_per_unit=current_close,
-                            amount=buy_amount,
-                            cash_balance=cash_balance,
-                            units_accumulated=units_accumulated
-                        ))
-                        transaction_count += 1
             
             # Record portfolio value weekly
-            if current_date.dayofweek == 0 or current_date == df.index[-1]:
-                portfolio_value = units_accumulated * current_close + cash_balance
+            # if current_date.dayofweek == 0 or current_date == df.index[-1]:
+                portfolio_value = units_accumulated * etf_price
                 equity_curve.append(DailyPortfolioValue(
                     date=current_date_obj,
                     value=portfolio_value
                 ))
-                equity_count += 1
         
         logger.info(f"Step 6 DONE in {time.time() - step_start:.2f}s")
-        logger.info(f"  Transactions: {transaction_count}, Equity points: {equity_count}")
-        
+        logger.info(f"  Total trading days: {regular_days + dip_days}")
+        logger.info(f"  Regular days: {regular_days}")
+        logger.info(f"  Dip buying days: {dip_days} ({dip_days/(regular_days+dip_days)*100:.1f}%)")
+        logger.info(f"  Max carry-over accumulated: ₹{max_carry_over:.2f}")
         # Step 7: Calculate metrics
         step_start = time.time()
         logger.info(f"Step 7: Calculating final metrics...")
@@ -221,9 +283,7 @@ def run_backtest(
             'amount': final_portfolio_value
         })
         
-        xirr_start = time.time()
         xirr_value = calculate_xirr(xirr_transactions)
-        logger.info(f"  XIRR calculation: {time.time() - xirr_start:.2f}s")
         if xirr_value is not None:
             xirr_value = xirr_value * 100
         
@@ -245,13 +305,13 @@ def run_backtest(
         
         logger.info(f"Step 7 DONE in {time.time() - step_start:.2f}s")
         
-        # Step 8: Process benchmark
+        # Step 8: Process benchmark (also with daily SIP for comparison)
         step_start = time.time()
         logger.info(f"Step 8: Processing benchmark...")
         
-        benchmark_curve, benchmark_return = _process_benchmark(
+        benchmark_curve, benchmark_return = _process_benchmark_daily_sip(
             benchmark_data,
-            sip_amount,
+            base_sip_amount,
             df.index.min().date(),
             df.index.max().date()
         )
@@ -268,16 +328,18 @@ def run_backtest(
             benchmark_return=benchmark_return,
             cagr=cagr_value,
             max_drawdown=max_dd,
-            message="Backtest completed successfully"
+            message="Optimized market-based strategy completed successfully"
         )
         
         total_time = time.time() - start_time
         logger.info(f"=" * 80)
-        logger.info(f"BACKTEST COMPLETE in {total_time:.2f}s")
-        logger.info(f"Investment: ₹{total_investment:.2f}")
+        logger.info(f"OPTIMIZED BACKTEST COMPLETE in {total_time:.2f}s")
+        logger.info(f"Total Investment: ₹{total_investment:.2f}")
         logger.info(f"Final Value: ₹{final_portfolio_value:.2f}")
-        logger.info(f"Return: {absolute_return_pct:.2f}%")
+        logger.info(f"Absolute Return: {absolute_return_pct:.2f}%")
         logger.info(f"XIRR: {xirr_value:.2f}%" if xirr_value else "XIRR: N/A")
+        logger.info(f"CAGR: {cagr_value:.2f}%" if cagr_value else "CAGR: N/A")
+        logger.info(f"Benchmark Return: {benchmark_return:.2f}%" if benchmark_return else "Benchmark: N/A")
         logger.info(f"=" * 80)
         
         return StrategyResult(
@@ -285,30 +347,35 @@ def run_backtest(
             benchmark_curve=benchmark_curve,
             transactions=transactions,
             summary_stats=summary,
-            message="Backtest completed successfully"
+            message="Optimized market-based strategy completed successfully"
         )
         
     except Exception as e:
         logger.error(f"ERROR in backtest after {time.time() - start_time:.2f}s: {e}", exc_info=True)
         return _create_empty_result(f"Backtest error: {str(e)}")
 
-
-def _process_benchmark(
+def _process_benchmark_daily_sip(
     benchmark_data: Optional[List[HistoricalPrice]],
-    sip_amount: float,
+    daily_sip_amount: float,
     start_date: date,
     end_date: date
 ) -> tuple[List[DailyPortfolioValue], Optional[float]]:
-    """Process benchmark data."""
+    """
+    Process benchmark with simple daily SIP (no dip buying).
+    
+    Returns:
+        - benchmark_curve: Weekly portfolio values for visualization
+        - benchmark_xirr: XIRR % (annualized return) for fair comparison
+    """
     if not benchmark_data:
         logger.info("  No benchmark data provided")
         return [], None
     
     try:
         bench_start = time.time()
-        logger.info(f"  Processing {len(benchmark_data)} benchmark records...")
+        logger.info(f"  Processing benchmark with simple daily SIP...")
         
-        # Convert SQLAlchemy models to dict
+        # Convert to DataFrame
         data_dicts = []
         for hp in benchmark_data:
             data_dicts.append({
@@ -323,21 +390,21 @@ def _process_benchmark(
         # Filter to date range
         benchmark_df = benchmark_df.loc[start_date:end_date]
         
-        if benchmark_df.empty or 'close' not in benchmark_df.columns:
-            logger.warning("  Invalid benchmark data")
+        if benchmark_df.empty:
+            logger.warning("  Empty benchmark data after filtering")
             return [], None
         
-        # Forward fill
+        # Clean data
         benchmark_df['close'] = benchmark_df['close'].ffill()
         benchmark_df = benchmark_df.dropna(subset=['close'])
         
         logger.info(f"  Benchmark cleaned: {len(benchmark_df)} rows")
         
-        # Simulate monthly SIP
+        # Simulate daily SIP in benchmark
         benchmark_units = 0.0
         benchmark_investment = 0.0
         benchmark_curve: List[DailyPortfolioValue] = []
-        last_sip_year_month = None
+        benchmark_xirr_transactions: List[Dict[str, Any]] = []
         
         for b_date, b_row in benchmark_df.iterrows():
             b_close = b_row['close']
@@ -345,14 +412,17 @@ def _process_benchmark(
             if pd.isna(b_close) or b_close <= 0:
                 continue
             
-            year_month = (b_date.year, b_date.month)
+            # Daily SIP
+            benchmark_investment += daily_sip_amount
+            benchmark_units += daily_sip_amount / b_close
             
-            if year_month != last_sip_year_month:
-                benchmark_investment += sip_amount
-                benchmark_units += sip_amount / b_close
-                last_sip_year_month = year_month
+            # Record transaction for XIRR (negative = outflow)
+            benchmark_xirr_transactions.append({
+                'date': b_date.date(),
+                'amount': -daily_sip_amount
+            })
             
-            # Weekly recording
+            # Weekly recording for visualization
             if b_date.dayofweek == 0 or b_date == benchmark_df.index[-1]:
                 benchmark_value = benchmark_units * b_close
                 benchmark_curve.append(DailyPortfolioValue(
@@ -360,20 +430,38 @@ def _process_benchmark(
                     value=benchmark_value
                 ))
         
-        # Calculate return
+        # Calculate XIRR
         if benchmark_investment > 0 and benchmark_curve:
-            final_benchmark_value = benchmark_curve[-1].value
-            benchmark_return = ((final_benchmark_value - benchmark_investment) / 
-                              benchmark_investment * 100)
+            final_value = benchmark_curve[-1].value
+            
+            # Add final redemption for XIRR (positive = inflow)
+            benchmark_xirr_transactions.append({
+                'date': benchmark_curve[-1].date,
+                'amount': final_value
+            })
+            
+            # Calculate XIRR
+            benchmark_xirr = calculate_xirr(benchmark_xirr_transactions)
+            
+            if benchmark_xirr is not None:
+                benchmark_xirr = benchmark_xirr * 100  # Convert to percentage
+                logger.info(f"  Benchmark XIRR: {benchmark_xirr:.2f}%")
+            else:
+                logger.warning("  Benchmark XIRR calculation failed")
+                # Fallback to absolute return if XIRR fails
+                benchmark_xirr = ((final_value - benchmark_investment) / benchmark_investment * 100)
+                logger.info(f"  Benchmark absolute return (fallback): {benchmark_xirr:.2f}%")
         else:
-            benchmark_return = None
+            benchmark_xirr = None
+            logger.warning("  No benchmark investment to calculate return")
         
-        logger.info(f"  Benchmark done in {time.time() - bench_start:.2f}s: {len(benchmark_curve)} points, return={benchmark_return:.2f}%" if benchmark_return else "  Benchmark done: no return calculated")
+        logger.info(f"  Benchmark done in {time.time() - bench_start:.2f}s")
+        logger.info(f"  Benchmark: ₹{benchmark_investment:.2f} invested, {len(benchmark_xirr_transactions)-1} transactions")
         
-        return benchmark_curve, benchmark_return
+        return benchmark_curve, benchmark_xirr
         
     except Exception as e:
-        logger.error(f"  Error processing benchmark: {e}")
+        logger.error(f"  Error processing benchmark: {e}", exc_info=True)
         return [], None
 
 
@@ -392,3 +480,9 @@ def _create_empty_result(message: str) -> StrategyResult:
         ),
         message=message
     )
+
+def _list_to_csv(lst: List[Dict[str, Any]], filename: str) -> None:
+    """Utility to save list of dicts to CSV for debugging."""
+    df = pd.DataFrame(lst)
+    df.to_csv(filename, index=False)
+    logger.info(f"Saved debug data to {filename}")

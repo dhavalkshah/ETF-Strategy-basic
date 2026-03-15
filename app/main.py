@@ -5,7 +5,7 @@ from fastapi import FastAPI, APIRouter, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api.v1.endpoints import auth, backtest, advisor, instrument, transaction, portfolio
+from app.api.v1.endpoints import auth, backtest, advisor, instrument, transaction, portfolio, sync
 from app.schemas.msg import Msg
 from app.db.session import get_db
 from app.core.security import get_current_active_user
@@ -46,6 +46,12 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+)
+
+app.include_router(
+    sync.router,
+    prefix="/api/v1/sync",
+    tags=["Data Sync (Internal)"]
 )
 
 

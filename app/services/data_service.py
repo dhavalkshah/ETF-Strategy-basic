@@ -117,15 +117,19 @@ class DataService:
         total_days = (end_date - start_date).days
         # Rough estimate: 5/7 days are trading days minus holidays (~10 days/year)
         expected_trading_days = int(total_days * (5/7) * (355/365))
-        
+
         if cached_data:
-            cache_coverage = len(cached_data) / max(expected_trading_days, 1)
-            logger.info(f"  Cache coverage: {cache_coverage*100:.1f}% ({len(cached_data)}/{expected_trading_days} expected trading days)")
+            logger.info(f"  CACHE HIT: Returning {len(cached_data)} cached records")
+            return cached_data
+        
+        # if cached_data:
+        #     cache_coverage = len(cached_data) / max(expected_trading_days, 1)
+        #     logger.info(f"  Cache coverage: {cache_coverage*100:.1f}% ({len(cached_data)}/{expected_trading_days} expected trading days)")
             
-            # If we have good coverage (>60%), use cache
-            if cache_coverage > 0.6:
-                logger.info(f"  CACHE HIT: Returning {len(cached_data)} cached records")
-                return cached_data
+        #     # If we have good coverage (>60%), use cache
+        #     if cache_coverage > 0.6:
+        #         logger.info(f"  CACHE HIT: Returning {len(cached_data)} cached records")
+        #         return cached_data
 
         logger.info(f"  CACHE MISS: Fetching from external source")
 
@@ -288,24 +292,27 @@ class DataService:
         db: Session,
         query: str,
         instrument_type: Optional[str] = None
-    ) -> List[SymbolCache]:
+    ) -> List[Instrument]:
         """
-        Search using jugaad-data bhavcopy for comprehensive results.
-        This is separate from historical data fetching.
+        Search for symbols and cache results in Instrument table.
+        
+        REFACTORED: Now uses Instrument table instead of SymbolCache.
         """
+        from app.services.instrument_service import instrument_service
         
-        # Check cache first
-        cached_symbols = crud_symbol_cache.get_multi_by_partial_symbol(db, query)
-        if instrument_type:
-            cached_symbols = [s for s in cached_symbols if s.instrument_type == instrument_type]
+        # Check database cache first (Instrument table)
+        cached_instruments = instrument_service.search_instruments(
+            db, query, instrument_type, limit=50
+        )
 
-        if cached_symbols:
-            logger.info(f"Returning {len(cached_symbols)} cached symbols")
-            return cached_symbols
+        if cached_instruments:
+            logger.info(f"Returning {len(cached_instruments)} cached instruments for '{query}'")
+            return cached_instruments
 
-        logger.info(f"Cache miss - searching for '{query}'")
+        logger.info(f"Cache miss - searching external sources for '{query}'")
         
-        live_symbols: List[SymbolCacheCreate] = []
+        # Fetch from external sources
+        live_symbols: List[dict] = []  # List of {symbol, name, instrument_type}
 
         # Search based on instrument type
         if instrument_type == "INDEX":
@@ -318,78 +325,74 @@ class DataService:
         elif instrument_type == "MF":
             live_symbols.extend(await self._fetch_mfapi_symbols(query))
         else:
-            # Search all
+            # Search all types
             live_symbols.extend(await self._search_nse_indices(query))
             live_symbols.extend(await self._search_etfs_by_name(query))
             live_symbols.extend(await self._search_equities_from_bhavcopy(query))
             live_symbols.extend(await self._fetch_mfapi_symbols(query))
 
-        # Remove duplicates
+        # Remove duplicates by symbol
         seen = set()
         unique_symbols = []
         for sym in live_symbols:
-            if sym.symbol not in seen:
-                seen.add(sym.symbol)
+            if sym['symbol'] not in seen:
+                seen.add(sym['symbol'])
                 unique_symbols.append(sym)
 
-        # Cache results
-        saved_symbols = []
+        # Cache results to Instrument table
+        saved_instruments = []
         for symbol_data in unique_symbols:
             try:
-                existing = crud_symbol_cache.get_by_symbol(db, symbol_data.symbol)
-                if not existing:
-                    saved = crud_symbol_cache.create(db, obj_in=symbol_data)
-                    saved_symbols.append(saved)
-                else:
-                    saved_symbols.append(existing)
+                instrument = instrument_service.create_or_get_instrument(
+                    db,
+                    symbol=symbol_data['symbol'],
+                    name=symbol_data['name'],
+                    instrument_type=symbol_data['instrument_type']
+                )
+                saved_instruments.append(instrument)
             except Exception as e:
-                logger.error(f"Error caching: {e}")
+                logger.error(f"Error caching instrument: {e}")
                 continue
 
-        logger.info(f"Found {len(saved_symbols)} symbols")
-        return saved_symbols
-
-    async def _search_nse_indices(self, query: str) -> List[SymbolCacheCreate]:
+        logger.info(f"Found {len(saved_instruments)} instruments")
+        return saved_instruments
+    
+    async def _search_nse_indices(self, query: str) -> List[dict]:
         """Search in predefined index list."""
         results = []
         query_upper = query.upper()
         for idx in NSE_INDICES:
             if query_upper in idx:
-                results.append(SymbolCacheCreate(
-                    symbol=idx,
-                    name=idx,
-                    instrument_type="INDEX",
-                    source="Index_List"
-                ))
+                results.append({
+                    'symbol': idx,
+                    'name': idx,
+                    'instrument_type': 'INDEX'
+                })
         return results
 
-    async def _search_etfs_by_name(self, query: str) -> List[SymbolCacheCreate]:
+    async def _search_etfs_by_name(self, query: str) -> List[dict]:
         """Search ETFs by name in mapping."""
         results = []
         query_lower = query.lower()
         for symbol, name in ETF_NAME_MAPPING.items():
             if query_lower in name.lower() or query_lower in symbol.lower():
-                results.append(SymbolCacheCreate(
-                    symbol=symbol,
-                    name=name,
-                    instrument_type="ETF",
-                    source="ETF_Mapping"
-                ))
+                results.append({
+                    'symbol': symbol,
+                    'name': name,
+                    'instrument_type': 'ETF'
+                })
         return results
 
-    async def _search_etfs_from_bhavcopy(self, query: str) -> List[SymbolCacheCreate]:
+    async def _search_etfs_from_bhavcopy(self, query: str) -> List[dict]:
         """Search ETFs from bhavcopy."""
         return await self._search_from_bhavcopy(query, "ETF")
 
-    async def _search_equities_from_bhavcopy(self, query: str) -> List[SymbolCacheCreate]:
+    async def _search_equities_from_bhavcopy(self, query: str) -> List[dict]:
         """Search equities from bhavcopy."""
         return await self._search_from_bhavcopy(query, "EQUITY")
 
-    async def _search_from_bhavcopy(self, query: str, target_type: str) -> List[SymbolCacheCreate]:
-        """
-        Search from NSE bhavcopy using jugaad-data.
-        This is only used for SEARCH, not for historical data.
-        """
+    async def _search_from_bhavcopy(self, query: str, target_type: str) -> List[dict]:
+        """Search from NSE bhavcopy using jugaad-data."""
         results = []
         try:
             import tempfile
@@ -427,20 +430,18 @@ class DataService:
                 if target_type == "ETF":
                     if "BEES" in symbol or "ETF" in symbol or symbol in ETF_NAME_MAPPING:
                         name = ETF_NAME_MAPPING.get(symbol, symbol)
-                        results.append(SymbolCacheCreate(
-                            symbol=symbol,
-                            name=name,
-                            instrument_type="ETF",
-                            source="NSE_Bhavcopy"
-                        ))
+                        results.append({
+                            'symbol': symbol,
+                            'name': name,
+                            'instrument_type': 'ETF'
+                        })
                 else:  # EQUITY
                     if "BEES" not in symbol and "ETF" not in symbol:
-                        results.append(SymbolCacheCreate(
-                            symbol=symbol,
-                            name=symbol,
-                            instrument_type="EQUITY",
-                            source="NSE_Bhavcopy"
-                        ))
+                        results.append({
+                            'symbol': symbol,
+                            'name': symbol,
+                            'instrument_type': 'EQUITY'
+                        })
 
             shutil.rmtree(temp_dir, ignore_errors=True)
             
@@ -449,7 +450,7 @@ class DataService:
         
         return results
 
-    async def _fetch_mfapi_symbols(self, query: str) -> List[SymbolCacheCreate]:
+    async def _fetch_mfapi_symbols(self, query: str) -> List[dict]:
         """Search mutual funds via MFAPI."""
         results = []
         try:
@@ -460,12 +461,11 @@ class DataService:
             if isinstance(data, list):
                 for item in data[:50]:
                     try:
-                        results.append(SymbolCacheCreate(
-                            symbol=str(item["schemeCode"]),
-                            name=item["schemeName"],
-                            instrument_type="MF",
-                            source="MFAPI"
-                        ))
+                        results.append({
+                            'symbol': str(item["schemeCode"]),
+                            'name': item["schemeName"],
+                            'instrument_type': 'MF'
+                        })
                     except KeyError:
                         continue
         except Exception as e:
